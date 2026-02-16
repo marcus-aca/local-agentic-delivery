@@ -1,0 +1,28 @@
+# Markdown artifacts
+*.md
+!README.md
+!AGENTS.md
+!agent_policies.md
+
+# Python cache / bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local environment files
+.env
+.venv/
+venv/
+
+# Runtime artifacts
+*.log
+*.tmp
+
+# OS/editor noise
+.DS_Store
+
+# Terraform working files
+.terraform/
+*.tfstate
+*.tfstate.*
+infra/terraform.tfvars
