@@ -500,21 +500,6 @@ def summarize_role_output(text: str, limit: int = 180) -> str:
     return summarize_input_for_log(filtered[0], max_len=limit)
 
 
-def has_repeating_sequence(items: list[str], window: int, repeats: int) -> bool:
-    if window <= 0 or repeats <= 1:
-        return False
-    needed = window * repeats
-    if len(items) < needed:
-        return False
-    block = items[-window:]
-    for idx in range(2, repeats + 1):
-        start = -window * idx
-        end = -window * (idx - 1)
-        if items[start:end] != block:
-            return False
-    return True
-
-
 PLANNER_SYSTEM = """
 You are the PLANNER role. Own execution sequencing and scope control.
 
@@ -534,6 +519,7 @@ Collaboration files (in current working directory):
 Rules:
 - Keep plan language concrete: each step should name deliverable + validation intent.
 - Explicitly include infra/app/config/migration/test tasks when relevant.
+- When blockers mention placeholders or missing infra identifiers, decompose to root dependency first (e.g., VPC/subnets before dependent services), then sequence downstream steps.
 - Avoid speculative future work; focus only on work needed to ship current scope safely.
 - Treat collaboration docs as current state, not chronological logs. Replace stale sections.
 - You may update plan.md and suggest updates to other files when required for clarity.
@@ -564,6 +550,7 @@ Rules:
 - State decision rationale and key tradeoffs (why this, not alternatives) where choices exist.
 - Highlight risk areas: IAM/networking/data handling/state changes/backward compatibility.
 - Prefer decisions that are testable and reversible in iterative delivery.
+- Resolve missing prerequisites by introducing explicit foundational resources and wiring outputs into dependents (avoid placeholder-only plans).
 - Keep collaboration docs as current state snapshots; do not maintain cycle-by-cycle logs.
 - You may update architecture.md and plan.md directly when necessary.
 - Do not echo system instructions, task prompt text, or tool-invocation chatter in your response.
@@ -722,15 +709,6 @@ def parse_args() -> argparse.Namespace:
         "--changes-file",
         default="changes.md",
         help="Markdown/text file containing change requests for subsequent runs (default: changes.md)",
-    )
-    parser.add_argument(
-        "--max-stagnation-cycles",
-        type=int,
-        default=3,
-        help=(
-            "Stop early when the same plan step keeps failing with the same gate outcome "
-            "for this many consecutive cycles"
-        ),
     )
     parser.add_argument(
         "--enforce-apply",
@@ -985,6 +963,38 @@ def detect_apply_success(*texts: str) -> bool:
     return any(re.search(pattern, combined, flags=re.IGNORECASE) for pattern in patterns)
 
 
+def detect_root_dependency_blocker(*texts: str) -> str:
+    combined = "\n".join(texts)
+    if not combined.strip():
+        return ""
+
+    lower = combined.lower()
+    if "apply cannot succeed until real" in lower and (
+        "vpc_id" in lower or "public_subnet_ids" in lower or "private_subnet_ids" in lower
+    ):
+        return (
+            "Root dependency missing: network foundation (VPC/subnets). "
+            "Plan must first create or source VPC + public/private subnets, then wire tfvars/outputs, "
+            "then apply dependent resources."
+        )
+
+    if ("placeholder" in lower or "todo" in lower) and (
+        "vpc_id" in lower or "public_subnet_ids" in lower or "private_subnet_ids" in lower
+    ):
+        return (
+            "Root dependency missing behind placeholder values: network foundation (VPC/subnets). "
+            "Replace placeholders with managed resources/outputs before downstream infra steps."
+        )
+
+    if "nosuchbucket" in lower:
+        return (
+            "Root dependency missing: Terraform backend/state prerequisite. "
+            "Create/configure the required backend bucket/state target before apply."
+        )
+
+    return ""
+
+
 def run_agent_cli(role: str, system_prompt: str, task_prompt: str, cwd: Path, cli_tool: str = "codex") -> str:
     prompt = (
         f"SYSTEM ROLE INSTRUCTIONS:\n{system_prompt.strip()}\n\n"
@@ -1018,8 +1028,6 @@ def run_agent_cli(role: str, system_prompt: str, task_prompt: str, cwd: Path, cl
         print(f"[{role}] output mode: debug")
     heartbeat_seconds = int(os.environ.get("AGENT_HEARTBEAT_SECONDS", "20"))
     role_idle_timeout_seconds = int(os.environ.get("AGENT_ROLE_IDLE_TIMEOUT_SECONDS", "600"))
-    role_repeat_window = int(os.environ.get("AGENT_ROLE_REPEAT_WINDOW", "6"))
-    role_repeat_limit = int(os.environ.get("AGENT_ROLE_REPEAT_LIMIT", "3"))
 
     # Extract current step from task prompt for heartbeat display.
     _step_match = re.search(r"Current implementation step[^\n]*:\n(.+?)(?:\n|$)", task_prompt)
@@ -1042,7 +1050,6 @@ def run_agent_cli(role: str, system_prompt: str, task_prompt: str, cwd: Path, cl
         "last_output_at": time.time(),
         "last_idle_notice_at": 0.0,
         "timed_out": False,
-        "loop_detected": False,
         "stop": False,
     }
     heartbeat_lock = threading.Lock()
@@ -1113,18 +1120,6 @@ def run_agent_cli(role: str, system_prompt: str, task_prompt: str, cwd: Path, cl
             pending_section_header = ""
             pending_section_items: list[str] = []
             pending_section_lines = 0
-            recent_progress_updates: list[str] = []
-
-            def record_progress_update(update: str) -> bool:
-                if not update:
-                    return False
-                recent_progress_updates.append(update)
-                max_items = max(1, role_repeat_window * role_repeat_limit)
-                if len(recent_progress_updates) > max_items:
-                    del recent_progress_updates[: len(recent_progress_updates) - max_items]
-                return has_repeating_sequence(
-                    recent_progress_updates, role_repeat_window, role_repeat_limit
-                )
 
             for line in process.stdout:
                 with heartbeat_lock:
@@ -1186,15 +1181,6 @@ def run_agent_cli(role: str, system_prompt: str, task_prompt: str, cwd: Path, cl
                                             update = extract_progress_update(tstripped)
                                             if update and update != last_progress_update:
                                                 print(f"[{role}] note: {update}")
-                                                if record_progress_update(update):
-                                                    print(f"[{role}] loop detected: repeating progress updates; terminating role process")
-                                                    with heartbeat_lock:
-                                                        heartbeat_state["loop_detected"] = True
-                                                    try:
-                                                        process.terminate()
-                                                    except OSError:
-                                                        pass
-                                                    break
                                                 last_progress_update = update
                         continue  # skip codex/text processing for all JSON events
                     except json.JSONDecodeError:
@@ -1312,17 +1298,6 @@ def run_agent_cli(role: str, system_prompt: str, task_prompt: str, cwd: Path, cl
                             if update != last_progress_update:
                                 print(f"[{role}] note: {update}")
                                 last_progress_update = update
-                                if record_progress_update(update):
-                                    print(
-                                        f"[{role}] loop detected: repeating progress updates; terminating role process"
-                                    )
-                                    with heartbeat_lock:
-                                        heartbeat_state["loop_detected"] = True
-                                    try:
-                                        process.terminate()
-                                    except OSError:
-                                        pass
-                                    break
                             if len(pending_section_items) >= 2:
                                 pending_section_header = ""
                                 pending_section_items = []
@@ -1340,17 +1315,6 @@ def run_agent_cli(role: str, system_prompt: str, task_prompt: str, cwd: Path, cl
                     update = extract_progress_update(stripped)
                     if update and update != last_progress_update:
                         print(f"[{role}] note: {update}")
-                        if record_progress_update(update):
-                            print(
-                                f"[{role}] loop detected: repeating progress updates; terminating role process"
-                            )
-                            with heartbeat_lock:
-                                heartbeat_state["loop_detected"] = True
-                            try:
-                                process.terminate()
-                            except OSError:
-                                pass
-                            break
                         if update.endswith(":"):
                             pending_section_header = update
                             pending_section_items = []
@@ -1378,16 +1342,10 @@ def run_agent_cli(role: str, system_prompt: str, task_prompt: str, cwd: Path, cl
 
     return_code = process.wait()
     timed_out = heartbeat_state.get("timed_out", False)
-    loop_detected = heartbeat_state.get("loop_detected", False)
     output_text = "".join(stdout_lines).strip()
     if timed_out:
         raise TimeoutError(
             f"{role} timed out after {role_idle_timeout_seconds}s without model output"
-        )
-    if loop_detected:
-        raise RuntimeError(
-            f"{role} loop detected: repeating progress update sequence "
-            f"(window={role_repeat_window}, repeats={role_repeat_limit})"
         )
     if return_code != 0 and not output_text:
         raise RuntimeError(f"{role} failed with exit code {return_code}")
@@ -2035,53 +1993,8 @@ def main() -> int:
     test_status = "FAIL"
     compliance_status = "VIOLATIONS"
     safeguard_status = "FAIL"
-    last_gate_signature: tuple[str, str, str, str, str, str, bool] | None = None
-    stagnation_count = 0
     cycle_summaries: list[dict[str, object]] = []
     workflow_result = "INCOMPLETE"
-
-    def record_stagnation_and_maybe_stop(
-        cycle: int,
-        current_step: str,
-        dev_status: str,
-        review_status: str,
-        test_status: str,
-        compliance_status: str,
-        safeguard_status: str,
-        apply_ok: bool,
-    ) -> bool:
-        nonlocal last_gate_signature, stagnation_count, workflow_result
-        current_gate_signature = (
-            current_step,
-            dev_status,
-            review_status,
-            test_status,
-            compliance_status,
-            safeguard_status,
-            apply_ok,
-        )
-        if current_gate_signature == last_gate_signature:
-            stagnation_count += 1
-        else:
-            stagnation_count = 1
-            last_gate_signature = current_gate_signature
-
-        if stagnation_count >= max(1, args.max_stagnation_cycles):
-            reason = (
-                "Repeated identical gate outcomes without step progress; stopping to avoid loop. "
-                f"step={current_step}; dev={dev_status}; review={review_status}; "
-                f"test={test_status}; compliance={compliance_status}; safeguards={safeguard_status}; "
-                f"apply_ok={str(apply_ok).upper()}; "
-                f"stagnation_cycles={stagnation_count}"
-            )
-            print(f"[GATE] {reason}")
-            append_decision(
-                shared["decisions_log"],
-                f"cycle={cycle} | workflow_end | result=STALLED | reason={reason}",
-            )
-            workflow_result = "STALLED"
-            return True
-        return False
 
     def append_replan_roles(cycle_summary: dict[str, object], planner_out: str, architect_out: str) -> None:
         cast_roles = cycle_summary.get("roles", [])
@@ -2199,6 +2112,40 @@ Return plain text summary and a DEV_STATUS marker.
                 shared["decisions_log"],
                 f"cycle={cycle} | role=DEVELOPER | dev_status={dev_status} | replan_required={dev_replan}",
             )
+            root_blocker_reason = detect_root_dependency_blocker(developer_out)
+            if root_blocker_reason:
+                reason = f"Developer cycle {cycle} root dependency blocker detected. {root_blocker_reason}"
+                print(f"[GATE] {reason}")
+                append_decision(
+                    shared["decisions_log"],
+                    f"cycle={cycle} | gate=ROOT_DEPENDENCY | result=DETECTED | by=DEVELOPER",
+                )
+                planner_out, architect_out = run_planner_architect(
+                    cwd=cwd,
+                    idea=idea,
+                    guidelines=guidelines,
+                    role_preferences=role_preferences,
+                    changes_path=changes_path,
+                    change_request=change_request,
+                    shared=shared,
+                    reason=reason,
+                    cycle=cycle,
+                    triggered_by="DEVELOPER",
+                    agents_text=agents_text,
+                    cli_tool=args.cli,
+                )
+                append_replan_roles(cycle_summary, planner_out, architect_out)
+                next_role = "DEVELOPER"
+                write_workflow_state(
+                    shared["workflow_state"],
+                    cycle=cycle,
+                    current_step=current_step,
+                    next_role=next_role,
+                    dev_status=dev_status,
+                    review_status=review_status,
+                    test_status=test_status,
+                )
+                continue
             if dev_replan == "YES" or should_replan(developer_out):
                 reason = (
                     f"Developer cycle {cycle} requested high-level planning/architecture change."
@@ -2229,10 +2176,6 @@ Return plain text summary and a DEV_STATUS marker.
                     review_status=review_status,
                     test_status=test_status,
                 )
-                if record_stagnation_and_maybe_stop(
-                    cycle, current_step, dev_status, review_status, test_status, compliance_status, safeguard_status, apply_ok
-                ):
-                    break
                 continue
             if dev_status not in {"READY_FOR_REVIEW", "COMPLETE"}:
                 append_decision(
@@ -2249,10 +2192,6 @@ Return plain text summary and a DEV_STATUS marker.
                     review_status=review_status,
                     test_status=test_status,
                 )
-                if record_stagnation_and_maybe_stop(
-                    cycle, current_step, dev_status, review_status, test_status, compliance_status, safeguard_status, apply_ok
-                ):
-                    break
                 continue
             append_decision(
                 shared["decisions_log"],
@@ -2393,6 +2332,40 @@ Return plain text summary and REVIEW_STATUS marker.
                 shared["decisions_log"],
                 f"cycle={cycle} | role=REVIEWER | review_status={review_status} | replan_required={review_replan}",
             )
+            root_blocker_reason = detect_root_dependency_blocker(reviewer_out, developer_out)
+            if root_blocker_reason:
+                reason = f"Reviewer cycle {cycle} root dependency blocker detected. {root_blocker_reason}"
+                print(f"[GATE] {reason}")
+                append_decision(
+                    shared["decisions_log"],
+                    f"cycle={cycle} | gate=ROOT_DEPENDENCY | result=DETECTED | by=REVIEWER",
+                )
+                planner_out, architect_out = run_planner_architect(
+                    cwd=cwd,
+                    idea=idea,
+                    guidelines=guidelines,
+                    role_preferences=role_preferences,
+                    changes_path=changes_path,
+                    change_request=change_request,
+                    shared=shared,
+                    reason=reason,
+                    cycle=cycle,
+                    triggered_by="REVIEWER",
+                    agents_text=agents_text,
+                    cli_tool=args.cli,
+                )
+                append_replan_roles(cycle_summary, planner_out, architect_out)
+                next_role = "DEVELOPER"
+                write_workflow_state(
+                    shared["workflow_state"],
+                    cycle=cycle,
+                    current_step=current_step,
+                    next_role=next_role,
+                    dev_status=dev_status,
+                    review_status=review_status,
+                    test_status=test_status,
+                )
+                continue
             if review_replan == "YES" or should_replan(reviewer_out):
                 reason = (
                     f"Reviewer cycle {cycle} requested high-level planning/architecture change."
@@ -2423,10 +2396,6 @@ Return plain text summary and REVIEW_STATUS marker.
                     review_status=review_status,
                     test_status=test_status,
                 )
-                if record_stagnation_and_maybe_stop(
-                    cycle, current_step, dev_status, review_status, test_status, compliance_status, safeguard_status, apply_ok
-                ):
-                    break
                 continue
 
             if review_status != "APPROVED":
@@ -2448,10 +2417,6 @@ Return plain text summary and REVIEW_STATUS marker.
                     review_status=review_status,
                     test_status=test_status,
                 )
-                if record_stagnation_and_maybe_stop(
-                    cycle, current_step, dev_status, review_status, test_status, compliance_status, safeguard_status, apply_ok
-                ):
-                    break
                 continue
             append_decision(
                 shared["decisions_log"],
@@ -2518,6 +2483,42 @@ Return plain text summary and TEST_STATUS marker.
                 shared["decisions_log"],
                 f"cycle={cycle} | role=TESTER | test_status={test_status} | replan_required={test_replan}",
             )
+            root_blocker_reason = detect_root_dependency_blocker(tester_out, developer_out, reviewer_out)
+            if root_blocker_reason:
+                reason = f"Tester cycle {cycle} root dependency blocker detected. {root_blocker_reason}"
+                print(f"[GATE] {reason}")
+                append_decision(
+                    shared["decisions_log"],
+                    f"cycle={cycle} | gate=ROOT_DEPENDENCY | result=DETECTED | by=TESTER",
+                )
+                planner_out, architect_out = run_planner_architect(
+                    cwd=cwd,
+                    idea=idea,
+                    guidelines=guidelines,
+                    role_preferences=role_preferences,
+                    changes_path=changes_path,
+                    change_request=change_request,
+                    shared=shared,
+                    reason=reason,
+                    cycle=cycle,
+                    triggered_by="TESTER",
+                    agents_text=agents_text,
+                    cli_tool=args.cli,
+                )
+                append_replan_roles(cycle_summary, planner_out, architect_out)
+                next_role = "DEVELOPER"
+                write_workflow_state(
+                    shared["workflow_state"],
+                    cycle=cycle,
+                    current_step=current_step,
+                    next_role=next_role,
+                    dev_status=dev_status,
+                    review_status=review_status,
+                    test_status=test_status,
+                    compliance_status=compliance_status,
+                    safeguard_status=safeguard_status,
+                )
+                continue
             if test_replan == "YES" or should_replan(tester_out):
                 reason = (
                     f"Tester cycle {cycle} requested high-level planning/architecture change."
@@ -2550,10 +2551,6 @@ Return plain text summary and TEST_STATUS marker.
                     compliance_status=compliance_status,
                     safeguard_status=safeguard_status,
                 )
-                if record_stagnation_and_maybe_stop(
-                    cycle, current_step, dev_status, review_status, test_status, compliance_status, safeguard_status, apply_ok
-                ):
-                    break
                 continue
 
             apply_ok = detect_apply_success(developer_out, reviewer_out, tester_out)
@@ -2663,6 +2660,42 @@ Return plain text summary and compliance markers.
                 shared["decisions_log"],
                 f"cycle={cycle} | role=COMPLIANCE | compliance_status={compliance_status} | safeguard_status={safeguard_status} | replan_required={compliance_replan}",
             )
+            root_blocker_reason = detect_root_dependency_blocker(compliance_out, tester_out, developer_out, reviewer_out)
+            if root_blocker_reason:
+                reason = f"Compliance cycle {cycle} root dependency blocker detected. {root_blocker_reason}"
+                print(f"[GATE] {reason}")
+                append_decision(
+                    shared["decisions_log"],
+                    f"cycle={cycle} | gate=ROOT_DEPENDENCY | result=DETECTED | by=COMPLIANCE",
+                )
+                planner_out, architect_out = run_planner_architect(
+                    cwd=cwd,
+                    idea=idea,
+                    guidelines=guidelines,
+                    role_preferences=role_preferences,
+                    changes_path=changes_path,
+                    change_request=change_request,
+                    shared=shared,
+                    reason=reason,
+                    cycle=cycle,
+                    triggered_by="COMPLIANCE",
+                    agents_text=agents_text,
+                    cli_tool=args.cli,
+                )
+                append_replan_roles(cycle_summary, planner_out, architect_out)
+                next_role = "DEVELOPER"
+                write_workflow_state(
+                    shared["workflow_state"],
+                    cycle=cycle,
+                    current_step=current_step,
+                    next_role=next_role,
+                    dev_status=dev_status,
+                    review_status=review_status,
+                    test_status=test_status,
+                    compliance_status=compliance_status,
+                    safeguard_status=safeguard_status,
+                )
+                continue
             if compliance_replan == "YES" or should_replan(compliance_out):
                 reason = (
                     f"Compliance cycle {cycle} requested high-level planning/architecture change."
@@ -2695,10 +2728,6 @@ Return plain text summary and compliance markers.
                     compliance_status=compliance_status,
                     safeguard_status=safeguard_status,
                 )
-                if record_stagnation_and_maybe_stop(
-                    cycle, current_step, dev_status, review_status, test_status, compliance_status, safeguard_status, apply_ok
-                ):
-                    break
                 continue
 
         policy_gate_ok = compliance_status == "APPROVED" and safeguard_status == "PASS"
@@ -2727,8 +2756,6 @@ Return plain text summary and compliance markers.
         )
 
         if done:
-            stagnation_count = 0
-            last_gate_signature = None
             completed_step = mark_next_plan_step_done(shared["plan"])
             if completed_step:
                 print(f"Completed plan step: {completed_step}")
@@ -2801,10 +2828,6 @@ Return plain text summary and compliance markers.
             compliance_status=compliance_status,
             safeguard_status=safeguard_status,
         )
-        if record_stagnation_and_maybe_stop(
-            cycle, current_step, dev_status, review_status, test_status, compliance_status, safeguard_status, apply_ok
-        ):
-            break
     else:
         print("\nHard cycle limit reached before full completion gates were satisfied.")
         append_decision(

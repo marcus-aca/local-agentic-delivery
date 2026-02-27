@@ -73,8 +73,6 @@ The current design includes several practical optimizations to reduce waste and 
   - Developer focuses on one checklist item per cycle to reduce scope creep.
 - Structured gates:
   - Required markers (`DEV_STATUS`, `REVIEW_STATUS`, `TEST_STATUS`, `REPLAN_REQUIRED`) drive transitions.
-- Stagnation detection:
-  - Stops early when repeated identical gate outcomes indicate no progress.
 - Resume safety:
   - Uses `workflow_state.json` to resume from the correct role/step.
 - State-of-world memory docs:
